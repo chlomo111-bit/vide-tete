@@ -125,6 +125,13 @@ form.add .lbl{font-size:13px;color:var(--muted)}
 .sheet .row>label{flex:1 1 130px}
 .sheet .acts{display:flex;justify-content:space-between;gap:10px;margin-top:6px;flex-wrap:wrap}
 .danger{background:none;border:none;color:var(--late);font-weight:600}
+.sources{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;font-size:12.5px;color:var(--muted)}
+.sources .s{display:inline-flex;gap:5px;align-items:center}
+.sources .s::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--line)}
+.sources .s.ok::before{background:var(--ok)}
+.sources .s.ko::before{background:var(--late)}
+.sources button{background:none;border:none;color:var(--accent);font-weight:600;padding:0;font-size:12.5px}
+.tag.src{background:var(--sunk);border-color:transparent}
 .notice{font-size:13px;color:var(--muted);background:var(--sunk);border-radius:10px;padding:10px 12px}
 </style>
 </head>
@@ -169,6 +176,7 @@ form.add .lbl{font-size:13px;color:var(--muted)}
   <div class="outils" id="outils">
     <input class="search" id="recherche" type="search" placeholder="Chercher (Hot, galerie, Tal…)" aria-label="Chercher">
     <div class="doms" id="filtres"></div>
+    <div class="sources" id="sources" hidden></div>
   </div>
 
   <div class="notice" id="etatDonnees">Chargement de tes listes…</div>
@@ -229,7 +237,108 @@ const esc = s => String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">"
 const $ = id => document.getElementById(id);
 
 /* ---------- Données ---------- */
-const S = { items:[], routines:[], regles:[], vue:"liste", filtre:"tout", q:"" };
+const S = { items:[], routines:[], regles:[], externes:[], vue:"liste", filtre:"tout", q:"" };
+
+/* ---------- Tâches venues des autres applis (Agenda Google, bot Concierge) ---------- */
+const CONCIERGE = "f3d8e935-7c21-4ba1-87c9-dbda18bc2626";
+const SQL_BOT = `select t.id, t.kind, t.text, t.due_at, coalesce(c.name, c2.name, b.contact_name) as nom
+from assistant_tasks t
+left join conversations c on c.id=t.conversation_id
+left join bookings b on b.id = coalesce(t.booking_id, case when split_part(t.task_key,':',2) ~ '^[0-9a-f-]{36}$' then split_part(t.task_key,':',2)::uuid end)
+left join conversations c2 on c2.id = b.conversation_id
+where coalesce(t.done,false)=false and t.status in ('pending','queued') and t.kind in ('followup','gallery','postshoot','call','manual','todo')
+order by t.due_at nulls last limit 150`;
+const SRC = {
+  agenda:{nom:"Agenda Google", server:"Google Calendar", etat:"attente", maj:null, items:[]},
+  bot:{nom:"Bot Concierge", server:"Lovable", etat:"attente", maj:null, items:[]}
+};
+let mcp=null;
+const isoLocal = s => { const d=new Date(s); return isNaN(d) ? null : iso(d); };
+const heureLocal = s => { const d=new Date(s); return isNaN(d) ? null : String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0"); };
+const estSeance = ev => /📸|client|צילומ|séance|seance/i.test(ev.summary||"") || ev.colorId==="5";
+function depuisAgenda(payload){
+  const evs = Array.isArray(payload&&payload.events) ? payload.events : [];
+  const out=[];
+  for(const ev of evs){
+    if(!ev || ev.status==="cancelled") continue;
+    const debut = ev.start&&(ev.start.dateTime||ev.start.date); if(!debut) continue;
+    const jour = ev.start.dateTime ? isoLocal(ev.start.dateTime) : ev.start.date;
+    const seance = estSeance(ev);
+    out.push({id:"ag:"+ev.id, ext:"agenda", type:"rdv", titre:String(ev.summary||"Événement"), note:ev.location?String(ev.location):null,
+      domaine: seance?"photo":"perso", date:jour, heure: ev.start.dateTime?heureLocal(ev.start.dateTime):null});
+    if(seance && ev.start.dateTime){
+      out.push({id:"bat:"+ev.id, ext:"agenda", type:"tache", auto:true, titre:"Charger les batteries", note:"Séance demain : "+String(ev.summary||""),
+        domaine:"photo", date:addDays(jour,-1), heure:null});
+    }
+  }
+  return out;
+}
+function depuisBot(payload){
+  const rows = Array.isArray(payload&&payload.rows) ? payload.rows : [];
+  return rows.map(r=>{
+    const nom = String(r.nom||"un client"), txt=String(r.text||"");
+    let titre;
+    if(r.kind==="gallery") titre="Envoyer la galerie à "+nom;
+    else if(r.kind==="postshoot") titre="Répondre au bot : la séance avec "+nom+" s'est bien passée ? (oui / non)";
+    else if(r.kind==="followup") titre="Relancer "+nom;
+    else titre=txt.split("\n")[0]||"Tâche du bot";
+    const note = (r.kind==="followup"||r.kind==="call"||r.kind==="manual"||r.kind==="todo") ? txt : null;
+    return {id:"bot:"+r.id, ext:"bot", type:"tache", titre, note, domaine:"photo", date:r.due_at?isoLocal(r.due_at):null, heure:null};
+  });
+}
+function externesVisibles(){
+  const etat = new Map(S.externes.map(x=>[x.id,x]));
+  return [...SRC.agenda.items, ...SRC.bot.items].map(it=>{
+    const e = etat.get(it.id.replace(/[^A-Za-z0-9_\-.~:@+]/g,"_"));
+    return {...it, fait: !!(e&&e.fait), faitLe: e&&e.faitLe};
+  });
+}
+const tousItems = () => [...S.items, ...externesVisibles()];
+
+const MSG_ERR = {
+  server_not_connected: s=>`ajoute « ${s} » dans Réglages › Connecteurs de Claude`,
+  needs_reauth: s=>`reconnecte « ${s} » dans Réglages › Connecteurs`,
+  not_in_manifest: ()=>"pas autorisé pour cette page (menu Autorisations)",
+  approval_required: ()=>"en attente de ton accord",
+  selection_required: s=>`choisis quel compte « ${s} » utiliser`,
+  blocked_by_policy: ()=>"bloqué par ton organisation",
+  server_unavailable: ()=>"ne répond pas, réessaie plus tard",
+};
+function rendreSources(){
+  const el=$("sources"); if(!el) return;
+  if(!mcp){ el.hidden=true; return; }
+  el.hidden=false;
+  const parts=Object.values(SRC).map(s=>{
+    const cls = s.etat==="ok"?"ok":(s.etat==="attente"?"":"ko");
+    const txt = s.etat==="ok" ? `${s.nom} · à jour ${s.maj?heureLocal(s.maj):""}` : s.etat==="attente" ? `${s.nom} · chargement…` : `${s.nom} : ${(MSG_ERR[s.etat]||(()=>"pas disponible pour le moment"))(s.server)}`;
+    return `<span class="s ${cls}">${esc(txt)}</span>`;
+  });
+  parts.push(`<button data-act="actualiser">Actualiser</button>`);
+  el.innerHTML=parts.join("");
+}
+let dernierChargement=0;
+async function chargerSource(cle, tool, input, conv, force){
+  const s=SRC[cle];
+  try{
+    const res = await mcp.callTool(s.server, tool, input, {cache: force?{staleTime:0,gcTime:86400000,refresh:true}:{staleTime:600000,gcTime:86400000}});
+    s.items = conv(res.payload);
+    s.etat="ok"; s.maj = (res.cache&&res.cache.storedAt) || Date.now();
+  }catch(e){
+    const code = (e&&e.code)||"upstream_error";
+    s.etat = code;
+    if(["needs_reauth","server_not_connected","blocked_by_policy","not_in_manifest","approval_required"].includes(code)) s.items=[];
+  }
+  render();
+}
+function chargerSources(force){
+  if(!mcp) return;
+  dernierChargement=Date.now();
+  const t=today();
+  chargerSource("agenda","list_events",{startTime:t+"T00:00:00", endTime:addDays(t,15)+"T00:00:00", orderBy:"startTime", pageSize:100},
+    p=>depuisAgenda(p).filter(x=>x.date && x.date>=t), force);
+  chargerSource("bot","query_database",{project_id:CONCIERGE, sql:SQL_BOT}, depuisBot, force);
+}
+document.addEventListener("visibilitychange",()=>{ if(!document.hidden && mcp && Date.now()-dernierChargement>600000) chargerSources(false); });
 let db=null;
 const mem = { items:new Map(), routines:new Map(), regles:new Map() };
 async function ajouter(col, data){
@@ -294,10 +403,14 @@ function ligneItem(it, opts={}){
   if(it.date) tags.push(`<span class="tag${late?" late":""}">${late?"en retard · ":""}${esc(joliDate(it.date))}${it.heure?" · "+esc(it.heure):""}</span>`);
   else if(it.heure) tags.push(`<span class="tag">${esc(it.heure)}</span>`);
   if(it.auto) tags.push('<span class="tag auto">suite auto</span>');
-  const box = it.type==="idee" ? `<span class="dot" aria-hidden="true">✦</span>` : `<button class="chk${it.fait?" done":""}" data-act="toggle" data-id="${it.id}" aria-label="${it.fait?"Marquer à faire":"Marquer fait"}">${it.fait?ICON_CHECK:""}</button>`;
+  if(it.ext) tags.push(`<span class="tag src">${esc(SRC[it.ext].nom)}</span>`);
+  let box;
+  if(it.type==="idee") box=`<span class="dot" aria-hidden="true">✦</span>`;
+  else if(it.ext && it.type==="rdv") box=`<span class="dot" aria-hidden="true">📅</span>`;
+  else box=`<button class="chk${it.fait?" done":""}" data-act="${it.ext?"toggleExt":"toggle"}" data-id="${esc(it.id)}" aria-label="${it.fait?"Marquer à faire":"Marquer fait"}">${it.fait?ICON_CHECK:""}</button>`;
   const note = it.note ? `<div class="n">${esc(it.note)}</div>` : "";
-  return `<li class="${it.fait?"fait":""}">${box}<div class="it"><div class="t">${esc(it.titre)}</div>${note}<div class="meta">${tags.join("")}</div></div>
-    <button class="icon" data-act="edit" data-id="${it.id}" aria-label="Modifier">${ICON_EDIT}</button></li>`;
+  const edit = it.ext ? "" : `<button class="icon" data-act="edit" data-id="${it.id}" aria-label="Modifier">${ICON_EDIT}</button>`;
+  return `<li class="${it.fait?"fait":""}">${box}<div class="it"><div class="t">${esc(it.titre)}</div>${note}<div class="meta">${tags.join("")}</div></div>${edit}</li>`;
 }
 function ligneRoutine(r, opts={}){
   const e=etatRoutine(r);
@@ -312,7 +425,8 @@ const ordre = (a,b) => (a.date||"9999").localeCompare(b.date||"9999") || (a.heur
 
 function render(){
   const t=today(), fin=addDays(t,7);
-  const actifs=S.items.filter(i=>i.type!=="idee");
+  const actifs=tousItems().filter(i=>i.type!=="idee" && !(i.ext && i.date && i.date<t && i.type==="rdv"));
+  rendreSources();
   const ouverts=actifs.filter(i=>!i.fait);
   const idees=S.items.filter(i=>i.type==="idee");
   const rDue=S.routines.filter(r=>["due","retard"].includes(etatRoutine(r)));
@@ -399,6 +513,14 @@ document.addEventListener("click", async e=>{
   try{
     if(act==="toggle"){ const it=S.items.find(i=>i.id===id); if(it) await maj("items",id,{fait:!it.fait, faitLe: !it.fait?today():null}); }
     if(act==="routine"){ const r=S.routines.find(x=>x.id===id); if(r){ const deja=r.dernier===today(); await maj("routines",id,{dernier: deja?(r.avant||null):today(), avant: deja?null:(r.dernier||null)}); } }
+    if(act==="toggleExt"){
+      const it=externesVisibles().find(x=>x.id===id); if(!it) return;
+      const key=id.replace(/[^A-Za-z0-9_\-.~:@+]/g,"_");
+      const data={fait:!it.fait, faitLe: !it.fait?today():null, titre:it.titre, source:it.ext};
+      if(db) await db.collection("externes").doc(key).set(data);
+      else { const i=S.externes.findIndex(x=>x.id===key); if(i>=0) S.externes[i]={id:key,...data}; else S.externes.push({id:key,...data}); render(); }
+    }
+    if(act==="actualiser") chargerSources(true);
     if(act==="edit") ouvrirEdition(id);
     if(act==="delRegle") await suppr("regles",id);
     if(act==="delRoutine") await suppr("routines",id);
@@ -545,8 +667,8 @@ function parler(txt){
 }
 function resumeDuJour(){
   const t=today();
-  const ouverts=S.items.filter(i=>i.type!=="idee"&&!i.fait);
-  const auj=ouverts.filter(i=>i.date===t).sort(ordre), retard=ouverts.filter(i=>i.date&&i.date<t);
+  const ouverts=tousItems().filter(i=>i.type!=="idee"&&!i.fait);
+  const auj=ouverts.filter(i=>i.date===t).sort(ordre), retard=ouverts.filter(i=>i.date&&i.date<t&&!(i.ext&&i.type==="rdv"));
   const routs=S.routines.filter(r=>["due","retard"].includes(etatRoutine(r)));
   const total=auj.length+retard.length+routs.length;
   if(!total) return "Rien d'urgent aujourd'hui. Dis-moi dès que tu as une idée.";
@@ -593,14 +715,16 @@ try{ const v=localStorage.getItem("vt-vue"); if(v && $("v-"+v)) montrerVue(v); e
 
 (async ()=>{
   if(!window.claude){ $("etatDonnees").textContent="Ouvre cette page dans Claude pour retrouver tes listes."; return; }
-  const [d, s, t, dc] = await Promise.all(["db","sample","tts","dictation"].map(n=>window.claude.use(n).catch(()=>null)));
-  sample=s; tts=t; dict=dc;
+  const [d, s, t, dc, m] = await Promise.all(["db","sample","tts","dictation","mcp"].map(n=>window.claude.use(n).catch(()=>null)));
+  sample=s; tts=t; dict=dc; mcp=m;
+  if(mcp) chargerSources(false);
   if(tts) $("ecouter").hidden=false;
   if(dict) setupDictee();
   if(!d){ $("etatDonnees").textContent="Tes listes ne peuvent pas être enregistrées ici : ce que tu ajoutes disparaîtra en fermant la page."; return; }
   db=d;
   const recus=new Set(); let confirme=false;
   const timer=setTimeout(()=>{ if(!confirme){ $("etatDonnees").hidden=false; $("etatDonnees").textContent="Tes listes mettent du temps à arriver… vérifie ta connexion."; } },10000);
+  db.collection("externes").onSnapshot(snap=>{ S.externes=snap.docs.map(x=>({id:x.id,...x.data()})); render(); }, ()=>{});
   for(const col of ["items","routines","regles"]){
     db.collection(col).onSnapshot(snap=>{
       S[col]=snap.docs.map(x=>({id:x.id,...x.data()}));
